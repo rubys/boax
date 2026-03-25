@@ -48,7 +48,7 @@ impl NpmModuleLoader {
         })?;
 
         let options = ResolveOptions {
-            condition_names: vec!["import".into(), "require".into(), "module".into(), "default".into()],
+            condition_names: vec!["import".into(), "module".into(), "default".into()],
             extensions: vec![".js".into(), ".mjs".into(), ".cjs".into(), ".json".into()],
             main_fields: vec!["module".into(), "main".into()],
             ..ResolveOptions::default()
