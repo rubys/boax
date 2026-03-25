@@ -30,6 +30,24 @@ _.chunk([1, 2, 3, 4, 5, 6], 2).to_ruby  # => [[1, 2], [3, 4], [5, 6]]
 
 Under development. See [PLAN.md](PLAN.md) for the implementation roadmap.
 
+## The bang (`!`) escape hatch
+
+Ruby method calls on `Boax::JsObject` are proxied to JavaScript via `method_missing`. When a Ruby built-in method shadows a JS method name, append `!` to bypass Ruby and call the JS method directly.
+
+The most common case is `Promise.then()` — Ruby's `Kernel#then` intercepts the call before `method_missing` gets it:
+
+```ruby
+promise = fs["promises"].readFile("data.txt")
+
+# ✗ Calls Ruby's Kernel#then, not JS Promise.then()
+promise.then(callback)
+
+# ✓ Strips the !, calls JS promise.then(callback)
+promise.then!(callback)
+```
+
+This works for any JS method name that conflicts with a Ruby method. The `!` is stripped before the JS property lookup, so `obj.then!(cb)` calls `obj.then(cb)` on the JS side.
+
 ## Known Issues
 
 **Intl support is incomplete.** Boa 0.21 has partial Intl implementation — `Intl.NumberFormat` and `Intl.DateTimeFormat` throw "unimplemented" errors.

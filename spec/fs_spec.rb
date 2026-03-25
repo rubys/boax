@@ -233,4 +233,107 @@ RSpec.describe "fs module", skip: !File.directory?(File.join(__dir__, "..", "nod
       expect(fs2).to be_a(Boax::JsObject)
     end
   end
+
+  describe "callback variants" do
+    it "readFile calls callback with (null, data)" do
+      fs.writeFileSync("#{dir}/cb-read.txt", "callback data")
+      Boax.eval("globalThis.__cbData = null; globalThis.__cbErr = null")
+      cb = Boax.eval("(function(err, data) { globalThis.__cbErr = err; globalThis.__cbData = data; })")
+      fs.readFile("#{dir}/cb-read.txt", cb)
+      expect(Boax.eval("globalThis.__cbData")).to eq("callback data")
+      expect(Boax.eval("globalThis.__cbErr")).to be_nil
+    end
+
+    it "readFile calls callback with error for missing file" do
+      Boax.eval("globalThis.__cbErr2 = null")
+      cb = Boax.eval("(function(err) { globalThis.__cbErr2 = err ? err.message || String(err) : null; })")
+      fs.readFile("#{dir}/missing-cb.txt", cb)
+      expect(Boax.eval("globalThis.__cbErr2").to_s).to include("ENOENT")
+    end
+
+    it "writeFile calls callback on success" do
+      Boax.eval("globalThis.__wCalled = false")
+      cb = Boax.eval("(function(err) { globalThis.__wCalled = !err; })")
+      fs.writeFile("#{dir}/cb-write.txt", "via callback", cb)
+      expect(Boax.eval("globalThis.__wCalled")).to be true
+      expect(File.read("#{dir}/cb-write.txt")).to eq("via callback")
+    end
+
+    it "stat calls callback with (null, stats)" do
+      fs.writeFileSync("#{dir}/cb-stat.txt", "x")
+      Boax.eval("globalThis.__statSize = null")
+      cb = Boax.eval("(function(err, stats) { globalThis.__statSize = stats ? stats.size : null; })")
+      fs.stat("#{dir}/cb-stat.txt", cb)
+      expect(Boax.eval("globalThis.__statSize")).to eq(1)
+    end
+
+    it "mkdir calls callback" do
+      Boax.eval("globalThis.__mkdirOk = false")
+      cb = Boax.eval("(function(err) { globalThis.__mkdirOk = !err; })")
+      fs.mkdir("#{dir}/cb-mkdir", cb)
+      expect(Boax.eval("globalThis.__mkdirOk")).to be true
+      expect(File.directory?("#{dir}/cb-mkdir")).to be true
+    end
+
+    it "unlink calls callback" do
+      fs.writeFileSync("#{dir}/cb-unlink.txt", "x")
+      Boax.eval("globalThis.__unlinkOk = false")
+      cb = Boax.eval("(function(err) { globalThis.__unlinkOk = !err; })")
+      fs.unlink("#{dir}/cb-unlink.txt", cb)
+      expect(Boax.eval("globalThis.__unlinkOk")).to be true
+      expect(File.exist?("#{dir}/cb-unlink.txt")).to be false
+    end
+  end
+
+  describe "fs.promises" do
+    let(:promises) { fs["promises"] }
+
+    # Use then! (bang) to call JS Promise.then() since Ruby's
+    # Kernel#then would otherwise intercept the call.
+
+    it "readFile returns a promise" do
+      fs.writeFileSync("#{dir}/p-read.txt", "promise data")
+      p = promises.readFile("#{dir}/p-read.txt")
+      expect(p.typeof).to eq("object")
+    end
+
+    it "readFile resolves with file contents" do
+      fs.writeFileSync("#{dir}/p-read2.txt", "promise data")
+      Boax.eval("globalThis.__pResult = null")
+      cb = Boax.eval("(function(d) { globalThis.__pResult = d; })")
+      promises.readFile("#{dir}/p-read2.txt").then!(cb)
+      expect(Boax.eval("globalThis.__pResult")).to eq("promise data")
+    end
+
+    it "readFile rejects for missing file" do
+      Boax.eval("globalThis.__pErr = null")
+      err_cb = Boax.eval("(function(e) { globalThis.__pErr = String(e); })")
+      promises.readFile("#{dir}/p-missing.txt").then!(Boax.eval("null"), err_cb)
+      expect(Boax.eval("globalThis.__pErr").to_s).to include("ENOENT")
+    end
+
+    it "writeFile resolves on success" do
+      Boax.eval("globalThis.__pDone = false")
+      cb = Boax.eval("(function() { globalThis.__pDone = true; })")
+      promises.writeFile("#{dir}/p-write.txt", "promise write").then!(cb)
+      expect(Boax.eval("globalThis.__pDone")).to be true
+      expect(File.read("#{dir}/p-write.txt")).to eq("promise write")
+    end
+
+    it "stat resolves with stats object" do
+      fs.writeFileSync("#{dir}/p-stat.txt", "hello")
+      Boax.eval("globalThis.__pSize = null")
+      cb = Boax.eval("(function(s) { globalThis.__pSize = s.size; })")
+      promises.stat("#{dir}/p-stat.txt").then!(cb)
+      expect(Boax.eval("globalThis.__pSize")).to eq(5)
+    end
+
+    it "mkdir resolves on success" do
+      Boax.eval("globalThis.__pMkdir = false")
+      cb = Boax.eval("(function() { globalThis.__pMkdir = true; })")
+      promises.mkdir("#{dir}/p-mkdir").then!(cb)
+      expect(Boax.eval("globalThis.__pMkdir")).to be true
+      expect(File.directory?("#{dir}/p-mkdir")).to be true
+    end
+  end
 end

@@ -210,7 +210,11 @@ where
     CONTEXT.with(|ctx| {
         let mut ctx = ctx.borrow_mut();
         let ctx = ctx.as_mut().unwrap();
-        f(ctx)
+        let result = f(ctx);
+        // Drain the promise job queue after every interaction so that
+        // microtasks (Promise .then callbacks, etc.) execute promptly.
+        let _ = ctx.run_jobs();
+        result
     })
 }
 
@@ -507,8 +511,13 @@ impl BoaxObject {
             return Err(Error::new(ruby_error_class(), "no method name given"));
         }
 
-        let method_name: String = args[0].funcall("to_s", ())?;
+        let raw_name: String = args[0].funcall("to_s", ())?;
         let ruby_args = &args[1..];
+
+        // Strip trailing `!` — escape hatch for when Ruby methods shadow JS ones.
+        // e.g., `promise.then!(cb)` calls JS `promise.then(cb)` since
+        // Ruby's Kernel#then would otherwise intercept the call.
+        let method_name = raw_name.strip_suffix('!').unwrap_or(&raw_name);
 
         // Handle `.new(...)` → JS construct
         if method_name == "new" {
@@ -565,7 +574,8 @@ impl BoaxObject {
             return Ok(false);
         }
 
-        let method_name: String = args[0].funcall("to_s", ())?;
+        let raw_name: String = args[0].funcall("to_s", ())?;
+        let method_name = raw_name.strip_suffix('!').unwrap_or(&raw_name);
 
         if method_name == "new" {
             return with_context(|_ctx| {

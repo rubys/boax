@@ -7,11 +7,12 @@ use boa_engine::{
     js_string,
     module::SyntheticModuleInitializer,
     object::JsObject,
-    object::builtins::JsArray,
+    object::builtins::{JsArray, JsPromise},
 };
 
 const EXPORT_NAMES: &[&str] = &[
     "default",
+    // Sync
     "readFileSync", "writeFileSync", "appendFileSync",
     "existsSync", "accessSync",
     "mkdirSync", "rmdirSync", "rmSync",
@@ -20,6 +21,15 @@ const EXPORT_NAMES: &[&str] = &[
     "unlinkSync", "renameSync", "copyFileSync",
     "chmodSync", "chownSync",
     "realpathSync",
+    // Callback
+    "readFile", "writeFile", "appendFile",
+    "mkdir", "rmdir", "rm",
+    "readdir", "stat", "lstat",
+    "unlink", "rename", "copyFile",
+    "chmod", "chown", "realpath",
+    "access",
+    // Promises namespace
+    "promises",
 ];
 
 pub fn create_module(context: &mut Context) -> Module {
@@ -49,6 +59,7 @@ fn init_fs_module(module: &boa_engine::module::SyntheticModule, context: &mut Co
 fn build_fs_object(context: &mut Context) -> boa_engine::JsResult<JsObject> {
     let obj = JsObject::with_object_proto(context.intrinsics());
 
+    // Sync operations
     set_fn(&obj, "readFileSync", 1, fs_read_file_sync, context)?;
     set_fn(&obj, "writeFileSync", 2, fs_write_file_sync, context)?;
     set_fn(&obj, "appendFileSync", 2, fs_append_file_sync, context)?;
@@ -66,6 +77,51 @@ fn build_fs_object(context: &mut Context) -> boa_engine::JsResult<JsObject> {
     set_fn(&obj, "chmodSync", 2, fs_chmod_sync, context)?;
     set_fn(&obj, "chownSync", 3, fs_chown_sync, context)?;
     set_fn(&obj, "realpathSync", 1, fs_realpath_sync, context)?;
+
+    // Callback variants: call sync impl, then invoke callback(err, result)
+    set_fn(&obj, "readFile", 1, cb_read_file, context)?;
+    set_fn(&obj, "writeFile", 2, cb_write_file, context)?;
+    set_fn(&obj, "appendFile", 2, cb_append_file, context)?;
+    set_fn(&obj, "mkdir", 1, cb_mkdir, context)?;
+    set_fn(&obj, "rmdir", 1, cb_rmdir, context)?;
+    set_fn(&obj, "rm", 1, cb_rm, context)?;
+    set_fn(&obj, "readdir", 1, cb_readdir, context)?;
+    set_fn(&obj, "stat", 1, cb_stat, context)?;
+    set_fn(&obj, "lstat", 1, cb_lstat, context)?;
+    set_fn(&obj, "unlink", 1, cb_unlink, context)?;
+    set_fn(&obj, "rename", 2, cb_rename, context)?;
+    set_fn(&obj, "copyFile", 2, cb_copy_file, context)?;
+    set_fn(&obj, "chmod", 2, cb_chmod, context)?;
+    set_fn(&obj, "chown", 3, cb_chown, context)?;
+    set_fn(&obj, "realpath", 1, cb_realpath, context)?;
+    set_fn(&obj, "access", 1, cb_access, context)?;
+
+    // fs.promises namespace
+    let promises = build_promises_object(context)?;
+    obj.set(js_string!("promises"), JsValue::from(promises), false, context)?;
+
+    Ok(obj)
+}
+
+fn build_promises_object(context: &mut Context) -> boa_engine::JsResult<JsObject> {
+    let obj = JsObject::with_object_proto(context.intrinsics());
+
+    set_fn(&obj, "readFile", 1, promise_read_file, context)?;
+    set_fn(&obj, "writeFile", 2, promise_write_file, context)?;
+    set_fn(&obj, "appendFile", 2, promise_append_file, context)?;
+    set_fn(&obj, "mkdir", 1, promise_mkdir, context)?;
+    set_fn(&obj, "rmdir", 1, promise_rmdir, context)?;
+    set_fn(&obj, "rm", 1, promise_rm, context)?;
+    set_fn(&obj, "readdir", 1, promise_readdir, context)?;
+    set_fn(&obj, "stat", 1, promise_stat, context)?;
+    set_fn(&obj, "lstat", 1, promise_lstat, context)?;
+    set_fn(&obj, "unlink", 1, promise_unlink, context)?;
+    set_fn(&obj, "rename", 2, promise_rename, context)?;
+    set_fn(&obj, "copyFile", 2, promise_copy_file, context)?;
+    set_fn(&obj, "chmod", 2, promise_chmod, context)?;
+    set_fn(&obj, "chown", 3, promise_chown, context)?;
+    set_fn(&obj, "realpath", 1, promise_realpath, context)?;
+    set_fn(&obj, "access", 1, promise_access, context)?;
 
     Ok(obj)
 }
@@ -468,4 +524,204 @@ fn fs_realpath_sync(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
         .map_err(|e| io_error(e, "realpathSync", &path))?;
 
     Ok(js_string!(&*real.to_string_lossy().to_string()).into())
+}
+
+// --- Callback variants ---
+// Pattern: find the callback (last function arg), call sync impl,
+// invoke callback(null, result) on success or callback(error) on failure.
+
+fn find_callback(args: &[JsValue]) -> Option<JsObject> {
+    args.iter().rev().find_map(|a| {
+        a.as_object().filter(|o| o.is_callable())
+    })
+}
+
+fn make_error_object(msg: &str, code: &str, context: &mut Context) -> boa_engine::JsResult<JsValue> {
+    let err_ctor = context.global_object().get(js_string!("Error"), context)?;
+    if let Some(ctor) = err_ctor.as_object() {
+        let err = ctor.construct(&[js_string!(msg).into()], None, context)?;
+        err.set(js_string!("code"), js_string!(code), false, context)?;
+        Ok(err.into())
+    } else {
+        Ok(js_string!(msg).into())
+    }
+}
+
+/// Call a sync fs function and invoke the callback with the result.
+/// `sync_fn` is called with `(this, args, context)` — the same args minus the callback.
+fn callback_wrap(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+    sync_fn: fn(&JsValue, &[JsValue], &mut Context) -> boa_engine::JsResult<JsValue>,
+) -> boa_engine::JsResult<JsValue> {
+    let cb = find_callback(args);
+
+    // Build args without the callback
+    let sync_args: Vec<JsValue> = args.iter()
+        .filter(|a| !a.as_object().is_some_and(|o| o.is_callable()))
+        .cloned()
+        .collect();
+
+    match sync_fn(this, &sync_args, context) {
+        Ok(result) => {
+            if let Some(cb) = cb {
+                cb.call(&JsValue::undefined(), &[JsValue::null(), result], context)?;
+            }
+        }
+        Err(err) => {
+            if let Some(cb) = cb {
+                let js_err = make_error_object(&err.to_string(), "ERR", context)?;
+                cb.call(&JsValue::undefined(), &[js_err], context)?;
+            } else {
+                return Err(err);
+            }
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
+/// Call a sync fs function and return a Promise with the result.
+fn promise_wrap(
+    this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+    sync_fn: fn(&JsValue, &[JsValue], &mut Context) -> boa_engine::JsResult<JsValue>,
+) -> boa_engine::JsResult<JsValue> {
+    match sync_fn(this, args, context) {
+        Ok(result) => Ok(JsPromise::resolve(result, context).into()),
+        Err(err) => Ok(JsPromise::reject(err, context).into()),
+    }
+}
+
+// --- Callback functions ---
+
+fn cb_read_file(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_read_file_sync)
+}
+
+fn cb_write_file(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_write_file_sync)
+}
+
+fn cb_append_file(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_append_file_sync)
+}
+
+fn cb_mkdir(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_mkdir_sync)
+}
+
+fn cb_rmdir(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_rmdir_sync)
+}
+
+fn cb_rm(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_rm_sync)
+}
+
+fn cb_readdir(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_readdir_sync)
+}
+
+fn cb_stat(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_stat_sync)
+}
+
+fn cb_lstat(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_lstat_sync)
+}
+
+fn cb_unlink(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_unlink_sync)
+}
+
+fn cb_rename(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_rename_sync)
+}
+
+fn cb_copy_file(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_copy_file_sync)
+}
+
+fn cb_chmod(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_chmod_sync)
+}
+
+fn cb_chown(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_chown_sync)
+}
+
+fn cb_realpath(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_realpath_sync)
+}
+
+fn cb_access(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    callback_wrap(this, args, ctx, fs_access_sync)
+}
+
+// --- Promise functions ---
+
+fn promise_read_file(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_read_file_sync)
+}
+
+fn promise_write_file(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_write_file_sync)
+}
+
+fn promise_append_file(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_append_file_sync)
+}
+
+fn promise_mkdir(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_mkdir_sync)
+}
+
+fn promise_rmdir(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_rmdir_sync)
+}
+
+fn promise_rm(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_rm_sync)
+}
+
+fn promise_readdir(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_readdir_sync)
+}
+
+fn promise_stat(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_stat_sync)
+}
+
+fn promise_lstat(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_lstat_sync)
+}
+
+fn promise_unlink(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_unlink_sync)
+}
+
+fn promise_rename(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_rename_sync)
+}
+
+fn promise_copy_file(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_copy_file_sync)
+}
+
+fn promise_chmod(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_chmod_sync)
+}
+
+fn promise_chown(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_chown_sync)
+}
+
+fn promise_realpath(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_realpath_sync)
+}
+
+fn promise_access(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> boa_engine::JsResult<JsValue> {
+    promise_wrap(this, args, ctx, fs_access_sync)
 }
