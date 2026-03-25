@@ -1,3 +1,4 @@
+*.swp
 /tmp/
 /lib/boax/boax.bundle
 /ext/boax/target/
