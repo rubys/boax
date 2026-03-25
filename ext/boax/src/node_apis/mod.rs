@@ -8,6 +8,7 @@ pub mod querystring;
 pub mod string_decoder;
 pub mod assert;
 pub mod url_module;
+pub mod buffer;
 
 use boa_engine::{Context, Module};
 
@@ -18,7 +19,7 @@ pub fn resolve_node_builtin(specifier: &str) -> Option<&str> {
     match name {
         "path" | "path/posix" | "util" | "events" | "fs" |
         "process" | "os" | "querystring" | "string_decoder" |
-        "assert" | "assert/strict" | "url" => Some(name),
+        "assert" | "assert/strict" | "url" | "buffer" => Some(name),
         _ => None,
     }
 }
@@ -36,6 +37,7 @@ pub fn create_node_module(name: &str, context: &mut Context) -> Module {
         "string_decoder" => string_decoder::create_module(context),
         "assert" | "assert/strict" => assert::create_module(context),
         "url" => url_module::create_module(context),
+        "buffer" => buffer::create_module(context),
         _ => unreachable!("unknown node builtin: {name}"),
     }
 }
