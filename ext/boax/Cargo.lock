@@ -273,6 +273,7 @@ dependencies = [
  "boa_gc",
  "boa_parser",
  "boa_runtime",
+ "libc",
  "magnus",
  "oxc_resolver",
  "rustc-hash 2.1.1",

@@ -1,6 +1,7 @@
 pub mod path;
 pub mod util;
 pub mod events;
+pub mod fs;
 
 use boa_engine::{Context, Module};
 
@@ -9,7 +10,7 @@ use boa_engine::{Context, Module};
 pub fn resolve_node_builtin(specifier: &str) -> Option<&str> {
     let name = specifier.strip_prefix("node:").unwrap_or(specifier);
     match name {
-        "path" | "path/posix" | "util" | "events" => Some(name),
+        "path" | "path/posix" | "util" | "events" | "fs" => Some(name),
         _ => None,
     }
 }
@@ -20,6 +21,7 @@ pub fn create_node_module(name: &str, context: &mut Context) -> Module {
         "path" | "path/posix" => path::create_module(context),
         "util" => util::create_module(context),
         "events" => events::create_module(context),
+        "fs" => fs::create_module(context),
         _ => unreachable!("unknown node builtin: {name}"),
     }
 }
