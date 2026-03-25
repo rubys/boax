@@ -1,3 +1,5 @@
+mod node_apis;
+
 use std::cell::RefCell;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -113,6 +115,17 @@ impl ModuleLoader for NpmModuleLoader {
         let result = (|| {
             let spec_str = specifier.to_std_string_escaped();
             let mut ctx = context.borrow_mut();
+
+            // Check for Node.js built-in modules (e.g., "path", "node:path")
+            if let Some(builtin_name) = node_apis::resolve_node_builtin(&spec_str) {
+                let cache_key = PathBuf::from(format!("node:{builtin_name}"));
+                if let Some(module) = self.get(&cache_key) {
+                    return Ok(module);
+                }
+                let module = node_apis::create_node_module(builtin_name, &mut ctx);
+                self.insert(cache_key, module.clone());
+                return Ok(module);
+            }
 
             let path = self.resolve_path(&spec_str, referrer.path(), &mut ctx)?;
 
@@ -232,6 +245,9 @@ fn ruby_to_js(val: Value, context: &mut Context) -> Result<JsValue, Error> {
         Ok(JsValue::from(true))
     } else if val.equal(ruby.qfalse())? {
         Ok(JsValue::from(false))
+    } else if let Ok(boax_obj) = <&BoaxObject as TryConvert>::try_convert(val) {
+        // Unwrap BoaxObject back to its inner JsValue
+        Ok(boax_obj.value().clone())
     } else if val.is_kind_of(ruby.class_integer()) {
         let i: i64 = TryConvert::try_convert(val)?;
         if let Ok(i32_val) = i32::try_from(i) {
@@ -518,13 +534,22 @@ impl BoaxObject {
             }
 
             if prop.is_callable() {
+                // If it looks like a constructor (uppercase name + constructable)
+                // and called with no args, return as proxy so .new() works.
+                // JS convention: constructors are PascalCase, methods are camelCase.
+                let prop_obj = prop.as_object().unwrap();
+                let looks_like_constructor = ruby_args.is_empty()
+                    && prop_obj.is_constructor()
+                    && method_name.starts_with(|c: char| c.is_ascii_uppercase());
+                if looks_like_constructor {
+                    return Ok(BoaxObject::wrap(prop));
+                }
+
                 let js_args: Vec<JsValue> = ruby_args
                     .iter()
                     .map(|a| ruby_to_js(*a, ctx))
                     .collect::<Result<_, _>>()?;
-                let result = prop
-                    .as_object()
-                    .unwrap()
+                let result = prop_obj
                     .call(self.value(), &js_args, ctx)
                     .map_err(|e| js_error_to_magnus(e, ctx))?;
                 js_to_ruby(&result, ctx)
@@ -609,9 +634,15 @@ fn import_module(name: &str, context: &mut Context) -> Result<JsValue, Error> {
         )
     })?;
 
+    // Check if we've already loaded this module
+    let entry_path = loader.root.join(format!("__boax_entry_{name}__.mjs"));
+    if let Some(cached) = loader.get(&entry_path) {
+        let namespace = cached.namespace(context);
+        return Ok(namespace.into());
+    }
+
     // Create a synthetic entry module: export * from '<name>'
     let entry_src = format!("export * from '{name}';\nexport {{ default }} from '{name}';");
-    let entry_path = loader.root.join(format!("__boax_entry_{name}__.mjs"));
 
     let source = Source::from_reader(entry_src.as_bytes(), Some(&entry_path));
     let module = Module::parse(source, None, context)
