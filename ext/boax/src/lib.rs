@@ -201,6 +201,8 @@ fn ensure_context_initialized() {
             let _ = boa_runtime::register(boa_runtime::extensions::ConsoleExtension::default(), None, &mut context);
             // Polyfill Intl.NumberFormat (currency/percent) and Intl.DateTimeFormat
             node_apis::intl_polyfill::register_intl_polyfills(&mut context);
+            // Register globalThis.crypto.getRandomValues (Web Crypto API)
+            register_web_crypto(&mut context);
             *ctx.borrow_mut() = Some(context);
         }
     });
@@ -679,38 +681,53 @@ fn import_module(name: &str, context: &mut Context) -> Result<JsValue, Error> {
         return Ok(namespace.into());
     }
 
-    // Create a synthetic entry module: export * from '<name>'
-    let entry_src = format!("export * from '{name}';\nexport {{ default }} from '{name}';");
+    // Create a synthetic entry module. Try with `export { default }` first;
+    // if link/evaluate fails (package has no default export), retry without it.
+    let entry_variants = [
+        format!("export * from '{name}';\nexport {{ default }} from '{name}';"),
+        format!("export * from '{name}';"),
+    ];
 
-    let source = Source::from_reader(entry_src.as_bytes(), Some(&entry_path));
-    let module = Module::parse(source, None, context)
-        .map_err(|e| js_error_to_magnus(e, context))?;
+    let mut last_err = None;
+    for entry_src in &entry_variants {
+        // Remove any previous failed entry from cache
+        loader.insert(entry_path.clone(), {
+            let source = Source::from_reader(entry_src.as_bytes(), Some(&entry_path));
+            match Module::parse(source, None, context) {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = Some(js_error_to_magnus(e, context));
+                    continue;
+                }
+            }
+        });
 
-    // Insert entry module into the loader's cache so it can be found
-    loader.insert(entry_path, module.clone());
+        let module = loader.get(&entry_path).unwrap();
+        let promise = module.load_link_evaluate(context);
+        let _ = context.run_jobs();
 
-    // Load, link, evaluate
-    let promise = module.load_link_evaluate(context);
-    context.run_jobs().map_err(|e| js_error_to_magnus(e, context))?;
-
-    // Check promise state
-    match promise.state() {
-        PromiseState::Fulfilled(_) => {}
-        PromiseState::Rejected(err) => {
-            let js_err = JsError::from_opaque(err);
-            return Err(js_error_to_magnus(js_err, context));
-        }
-        PromiseState::Pending => {
-            return Err(Error::new(
-                ruby_error_class(),
-                format!("module '{name}' did not finish loading"),
-            ));
+        match promise.state() {
+            PromiseState::Fulfilled(_) => {
+                let namespace = module.namespace(context);
+                return Ok(namespace.into());
+            }
+            PromiseState::Rejected(err) => {
+                last_err = Some(js_error_to_magnus(JsError::from_opaque(err), context));
+                continue;
+            }
+            PromiseState::Pending => {
+                last_err = Some(Error::new(
+                    ruby_error_class(),
+                    format!("module '{name}' did not finish loading"),
+                ));
+                continue;
+            }
         }
     }
 
-    // Get the module namespace (contains all exports)
-    let namespace = module.namespace(context);
-    Ok(namespace.into())
+    Err(last_err.unwrap_or_else(|| {
+        Error::new(ruby_error_class(), format!("failed to load module '{name}'"))
+    }))
 }
 
 // --- Module-level functions ---
@@ -726,7 +743,14 @@ fn boax_eval(code: String) -> Result<Value, Error> {
 
 fn boax_import(name: String) -> Result<Value, Error> {
     with_context(|ctx| {
-        // First, try as a JS global (Math, JSON, Date, etc.)
+        // Check for Node built-in modules first (they take priority over globals
+        // since we may have registered globals like `crypto` that shadow them)
+        if node_apis::resolve_node_builtin(&name).is_some() {
+            let ns = import_module(&name, ctx)?;
+            return Ok(BoaxObject::wrap(ns));
+        }
+
+        // Try as a JS global (Math, JSON, Date, Intl, etc.)
         let global = ctx.global_object();
         let prop = global
             .get(js_string!(&*name), ctx)
@@ -953,6 +977,52 @@ fn build_cjs_require_fn(referrer_path: &std::path::Path, context: &mut Context) 
     Ok(require_fn.as_object().unwrap())
 }
 
+/// Register globalThis.crypto with getRandomValues (Web Crypto API).
+/// Needed by packages like uuid that use the web standard rather than Node's crypto.
+fn register_web_crypto(context: &mut Context) {
+    let crypto_obj = JsObject::with_object_proto(context.intrinsics());
+    let get_random = NativeFunction::from_fn_ptr(web_crypto_get_random_values)
+        .to_js_function(context.realm());
+    let _ = crypto_obj.set(js_string!("getRandomValues"), JsValue::from(get_random), false, context);
+    let random_uuid = NativeFunction::from_fn_ptr(web_crypto_random_uuid)
+        .to_js_function(context.realm());
+    let _ = crypto_obj.set(js_string!("randomUUID"), JsValue::from(random_uuid), false, context);
+    let _ = context.global_object().set(js_string!("crypto"), JsValue::from(crypto_obj), false, context);
+}
+
+fn web_crypto_get_random_values(_: &JsValue, args: &[JsValue], context: &mut Context) -> boa_engine::JsResult<JsValue> {
+    let arr = args.first()
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| JsNativeError::typ().with_message("argument must be a TypedArray"))?;
+
+    let length = arr.get(js_string!("length"), context)?
+        .as_number().unwrap_or(0.0) as usize;
+
+    let mut bytes = vec![0u8; length];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| JsNativeError::typ().with_message(format!("getRandomValues failed: {e}")))?;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        arr.set(i as u32, JsValue::from(b as i32), false, context)?;
+    }
+
+    Ok(args.first().cloned().unwrap_or(JsValue::undefined()))
+}
+
+fn web_crypto_random_uuid(_: &JsValue, _: &[JsValue], _: &mut Context) -> boa_engine::JsResult<JsValue> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| JsNativeError::typ().with_message(format!("randomUUID failed: {e}")))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let uuid = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    );
+    Ok(js_string!(&*uuid).into())
+}
+
 /// Register the native __boaxRequire function on the JS context.
 /// This is called from JS require() wrappers to resolve nested CJS requires.
 fn register_cjs_require_native(context: &mut Context) {
@@ -1014,6 +1084,7 @@ fn boax_init(root: String) -> Result<Value, Error> {
         .map_err(|e| Error::new(ruby_error_class(), format!("{e}")))?;
     let _ = boa_runtime::register(boa_runtime::extensions::ConsoleExtension::default(), None, &mut context);
     node_apis::intl_polyfill::register_intl_polyfills(&mut context);
+    register_web_crypto(&mut context);
 
     // Register CJS require native callback
     register_cjs_require_native(&mut context);
