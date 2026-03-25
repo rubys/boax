@@ -1,0 +1,14 @@
+[package]
+name = "boax"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = { version = "0.8", features = ["rb-sys"] }
+boa_engine = { version = "0.21", features = ["intl_bundled"] }
+boa_runtime = "0.21"
+boa_gc = "0.21"
