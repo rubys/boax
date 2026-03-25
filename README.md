@@ -23,7 +23,8 @@ _.uniq([1, 1, 2, 3, 3]).to_ruby          # => [1, 2, 3]
 ### What works
 
 - **`Boax.eval(code)`** — evaluate JS expressions, returns native Ruby types
-- **`Boax.import(name)`** — import JS globals (`Math`, `JSON`, `Date`) or npm packages (`lodash-es`)
+- **`Boax.import(name)`** — import JS globals (`Math`, `JSON`, `Date`) or ES module packages (`lodash-es`)
+- **`Boax.require(name)`** — load CommonJS packages (`minimist`, etc.)
 - **Proxy objects** — `method_missing` forwards Ruby calls to JS: `math.sqrt(144)`, `_.chunk([1,2,3], 2)`
 - **Constructors** — `Date.new(2024, 0, 15)` calls `new Date(2024, 0, 15)` in JS
 - **Type conversion** — nil, bool, integer, float, string, symbol, array, hash (both directions)
@@ -36,7 +37,6 @@ _.uniq([1, 1, 2, 3, 3]).to_ruby          # => [1, 2, 3]
 
 - **Intl** — Boa 0.21 has partial Intl support; `NumberFormat` and `DateTimeFormat` throw "unimplemented"
 - **Performance** — Boa has no JIT; compute-heavy JS will be slower than V8
-- **CommonJS** — only ES modules are supported; CJS packages need a bundler
 - **Streams** — MVP without backpressure; no real async I/O
 - **HTTP, child_process** — not yet implemented
 
@@ -62,7 +62,7 @@ bundle install
 bundle exec rake compile
 
 # Run the tests
-npm install       # installs lodash-es for integration tests
+npm install       # installs lodash-es and minimist for integration tests
 bundle exec rspec
 ```
 
@@ -91,6 +91,11 @@ path.join('/foo', 'bar', 'baz')  # => "/foo/bar/baz"
 fs = Boax.import('fs')
 fs.writeFileSync('/tmp/test.txt', 'hello')
 fs.readFileSync('/tmp/test.txt')  # => "hello"
+
+# CommonJS packages (use require instead of import)
+minimist = Boax.require('minimist')
+minimist.call(['--foo', 'bar', 'hello']).to_ruby
+# => {"_" => ["hello"], "foo" => "bar"}
 
 # Deep conversion to Ruby types
 Boax.eval("({a: [1, {b: 2}]})").to_ruby

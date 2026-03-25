@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use boa_engine::{
-    Context, JsError, JsNativeError, JsResult, JsString, JsValue, Module, Source,
+    Context, JsError, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction, Source,
     builtins::promise::PromiseState,
     js_string,
     module::{ModuleLoader, Referrer, resolve_module_specifier},
@@ -48,8 +48,8 @@ impl NpmModuleLoader {
         })?;
 
         let options = ResolveOptions {
-            condition_names: vec!["import".into(), "module".into(), "default".into()],
-            extensions: vec![".js".into(), ".mjs".into(), ".json".into()],
+            condition_names: vec!["import".into(), "require".into(), "module".into(), "default".into()],
+            extensions: vec![".js".into(), ".mjs".into(), ".cjs".into(), ".json".into()],
             main_fields: vec!["module".into(), "main".into()],
             ..ResolveOptions::default()
         };
@@ -508,6 +508,30 @@ impl BoaxObject {
         })
     }
 
+    /// Invoke the wrapped JS value directly as a function.
+    /// Used for bare function exports: `minimist.call("--foo", "bar")`
+    fn js_call(&self, args: &[Value]) -> Result<Value, Error> {
+        with_context(|ctx| {
+            let obj = self
+                .value()
+                .as_object()
+                .ok_or_else(|| Error::new(ruby_error_class(), "not a JS function"))?;
+
+            if !obj.is_callable() {
+                return Err(Error::new(ruby_error_class(), "not a JS function"));
+            }
+
+            let js_args: Vec<JsValue> = args
+                .iter()
+                .map(|a| ruby_to_js(*a, ctx))
+                .collect::<Result<_, _>>()?;
+            let result = obj
+                .call(&JsValue::undefined(), &js_args, ctx)
+                .map_err(|e| js_error_to_magnus(e, ctx))?;
+            js_to_ruby(&result, ctx)
+        })
+    }
+
     fn method_missing(&self, args: &[Value]) -> Result<Value, Error> {
         if args.is_empty() {
             return Err(Error::new(ruby_error_class(), "no method name given"));
@@ -716,6 +740,250 @@ fn boax_import(name: String) -> Result<Value, Error> {
     })
 }
 
+fn boax_require(name: String) -> Result<Value, Error> {
+    with_context(|ctx| {
+        let result = cjs_require(&name, None, ctx)?;
+        Ok(BoaxObject::wrap(result))
+    })
+}
+
+/// CommonJS require implementation.
+/// Wraps the file in (function(exports, require, module, __filename, __dirname) { ... })
+/// and executes it, returning module.exports.
+fn cjs_require(specifier: &str, referrer: Option<&std::path::Path>, context: &mut Context) -> Result<JsValue, Error> {
+    // Check for Node built-ins
+    let builtin_name = specifier.strip_prefix("node:").unwrap_or(specifier);
+    if node_apis::resolve_node_builtin(builtin_name).is_some() {
+        // Return the globalThis object for this builtin
+        node_apis::create_node_module(builtin_name, context);
+        // The globalThis pattern means the module's exports are available as globals
+        // For modules like fs, path, etc., we need to return the default export object
+        let global_name = match builtin_name {
+            "events" => "EventEmitter",
+            "buffer" => "Buffer",
+            "string_decoder" => "StringDecoder",
+            "stream" => "__BoaxStream",
+            _ => {
+                // For path, util, fs, process, os, querystring, assert, url, crypto:
+                // these are built with Rust NativeFunctions, not on globalThis.
+                // We need to create the module and get its namespace.
+                // Use an ES module import under the hood.
+                let ns = import_module(builtin_name, context)?;
+                return Ok(ns);
+            }
+        };
+        let val = context.global_object().get(js_string!(global_name), context)
+            .map_err(|e| js_error_to_magnus(e, context))?;
+        return Ok(val);
+    }
+
+    // Resolve the file path
+    let loader = MODULE_LOADER.with(|l| l.borrow().clone()).ok_or_else(|| {
+        Error::new(
+            ruby_error_class(),
+            format!(
+                "module '{specifier}' not found. \
+                 Call Boax.init(root: '/path/to/project') to enable npm package requires."
+            ),
+        )
+    })?;
+
+    let resolve_dir = referrer
+        .and_then(|p| p.parent())
+        .unwrap_or(&loader.root);
+
+    let resolved = loader.resolver
+        .resolve(resolve_dir, specifier)
+        .map_err(|err| {
+            Error::new(
+                ruby_error_class(),
+                format!("could not resolve '{specifier}': {err}"),
+            )
+        })?;
+    let path = resolved.into_path_buf();
+
+    // Check CJS cache
+    let cache_key = path.to_string_lossy().to_string();
+    let cached = context.global_object()
+        .get(js_string!("__boaxCjsCache"), context)
+        .ok()
+        .and_then(|v| v.as_object());
+
+    if let Some(cache) = &cached {
+        let entry = cache.get(js_string!(&*cache_key), context)
+            .unwrap_or(JsValue::undefined());
+        if !entry.is_undefined() {
+            return Ok(entry);
+        }
+    }
+
+    // Read the file
+    let source = std::fs::read_to_string(&path).map_err(|e| {
+        Error::new(
+            ruby_error_class(),
+            format!("could not read '{}': {e}", path.display()),
+        )
+    })?;
+
+    // Handle JSON files
+    if path.extension().is_some_and(|ext| ext == "json") {
+        let json_val = context.eval(Source::from_bytes(&format!("({})", source)))
+            .map_err(|e| js_error_to_magnus(e, context))?;
+        cjs_cache_set(context, &cache_key, &json_val)?;
+        return Ok(json_val);
+    }
+
+    // Create module object: { exports: {} }
+    let module_obj = JsObject::with_object_proto(context.intrinsics());
+    let exports_obj = JsObject::with_object_proto(context.intrinsics());
+    module_obj.set(js_string!("exports"), JsValue::from(exports_obj.clone()), false, context)
+        .map_err(|e| js_error_to_magnus(e, context))?;
+    module_obj.set(js_string!("id"), js_string!(&*cache_key), false, context)
+        .map_err(|e| js_error_to_magnus(e, context))?;
+    module_obj.set(js_string!("filename"), js_string!(&*path.to_string_lossy().to_string()), false, context)
+        .map_err(|e| js_error_to_magnus(e, context))?;
+    module_obj.set(js_string!("loaded"), JsValue::from(false), false, context)
+        .map_err(|e| js_error_to_magnus(e, context))?;
+
+    // Cache module.exports BEFORE execution (handles circular deps)
+    cjs_cache_set(context, &cache_key, &JsValue::from(exports_obj.clone()))?;
+
+    let dirname = path.parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let filename = path.to_string_lossy().to_string();
+
+    // Wrap in CJS function and execute
+    let wrapped = format!(
+        "(function(exports, require, module, __filename, __dirname) {{\n{source}\n}})"
+    );
+
+    let wrapper_fn = context.eval(Source::from_bytes(&wrapped))
+        .map_err(|e| js_error_to_magnus(e, context))?;
+
+    let wrapper_obj = wrapper_fn.as_object().ok_or_else(|| {
+        Error::new(ruby_error_class(), format!("failed to wrap CJS module: {specifier}"))
+    })?;
+
+    // Build the require function for this module's context
+    // Store the dirname so nested require() calls resolve relative to this file
+    let require_fn = build_cjs_require_fn(&path, context)?;
+
+    wrapper_obj.call(
+        &JsValue::undefined(),
+        &[
+            JsValue::from(exports_obj),
+            JsValue::from(require_fn),
+            JsValue::from(module_obj.clone()),
+            js_string!(&*filename).into(),
+            js_string!(&*dirname).into(),
+        ],
+        context,
+    ).map_err(|e| js_error_to_magnus(e, context))?;
+
+    // Mark as loaded
+    let _ = module_obj.set(js_string!("loaded"), JsValue::from(true), false, context);
+
+    // Return module.exports (may have been reassigned)
+    let result = module_obj.get(js_string!("exports"), context)
+        .map_err(|e| js_error_to_magnus(e, context))?;
+
+    // Update cache with final module.exports
+    cjs_cache_set(context, &cache_key, &result)?;
+
+    Ok(result)
+}
+
+fn cjs_cache_set(context: &mut Context, key: &str, value: &JsValue) -> Result<(), Error> {
+    let global = context.global_object();
+    let cache = global.get(js_string!("__boaxCjsCache"), context)
+        .unwrap_or(JsValue::undefined());
+
+    let cache_obj = if let Some(obj) = cache.as_object() {
+        obj
+    } else {
+        let obj = JsObject::with_object_proto(context.intrinsics());
+        global.set(js_string!("__boaxCjsCache"), JsValue::from(obj.clone()), false, context)
+            .map_err(|e| js_error_to_magnus(e, context))?;
+        obj
+    };
+
+    cache_obj.set(js_string!(key), value.clone(), false, context)
+        .map_err(|e| js_error_to_magnus(e, context))?;
+    Ok(())
+}
+
+/// Build a require() function that resolves relative to a specific file.
+fn build_cjs_require_fn(referrer_path: &std::path::Path, context: &mut Context) -> Result<JsObject, Error> {
+    let dirname = referrer_path.parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Store the referrer dirname in globalThis so the require function can access it
+    // We use a unique key per module to avoid collisions
+    let key = format!("__boaxCjsDir_{}", referrer_path.to_string_lossy().replace('/', "_"));
+    context.global_object()
+        .set(js_string!(&*key), js_string!(&*dirname), false, context)
+        .map_err(|e| js_error_to_magnus(e, context))?;
+
+    // Create a JS require function that calls back into our Rust require
+    // For now, use a simple implementation that stores the referrer path
+    let require_src = format!(
+        r#"(function() {{
+            var _dir = globalThis["{}"];
+            function require(id) {{
+                // Node builtins
+                if (typeof globalThis.__boaxRequire === 'function') {{
+                    return globalThis.__boaxRequire(id, _dir);
+                }}
+                throw new Error("require is not available: " + id);
+            }}
+            require.resolve = function(id) {{ return id; }};
+            require.cache = globalThis.__boaxCjsCache || {{}};
+            return require;
+        }})()"#,
+        key
+    );
+
+    let require_fn = context.eval(Source::from_bytes(&require_src))
+        .map_err(|e| js_error_to_magnus(e, context))?;
+
+    Ok(require_fn.as_object().unwrap())
+}
+
+/// Register the native __boaxRequire function on the JS context.
+/// This is called from JS require() wrappers to resolve nested CJS requires.
+fn register_cjs_require_native(context: &mut Context) {
+    let require_native = NativeFunction::from_fn_ptr(native_cjs_require)
+        .to_js_function(context.realm());
+    let _ = context.global_object().set(
+        js_string!("__boaxRequire"),
+        JsValue::from(require_native),
+        false,
+        context,
+    );
+}
+
+fn native_cjs_require(_: &JsValue, args: &[JsValue], context: &mut Context) -> boa_engine::JsResult<JsValue> {
+    let specifier = args.first()
+        .ok_or_else(|| JsNativeError::typ().with_message("require() needs a specifier"))?
+        .to_string(context)?
+        .to_std_string_escaped();
+    let dirname = args.get(1)
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+
+    let referrer = if dirname.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(&dirname).join("__dummy__.js"))
+    };
+
+    cjs_require(&specifier, referrer.as_deref(), context)
+        .map_err(|e| JsNativeError::typ().with_message(e.to_string()).into())
+}
+
 fn boax_init(root: String) -> Result<Value, Error> {
     let root_path = PathBuf::from(&root);
 
@@ -743,6 +1011,9 @@ fn boax_init(root: String) -> Result<Value, Error> {
         .build()
         .map_err(|e| Error::new(ruby_error_class(), format!("{e}")))?;
     let _ = boa_runtime::register(boa_runtime::extensions::ConsoleExtension::default(), None, &mut context);
+
+    // Register CJS require native callback
+    register_cjs_require_native(&mut context);
 
     // Store both
     MODULE_LOADER.with(|l| *l.borrow_mut() = Some(loader));
@@ -773,6 +1044,9 @@ static BOAX_JSOBJECT_CLASS: Lazy<magnus::RClass> = Lazy::new(|ruby| {
         .define_method("typeof", method!(BoaxObject::js_typeof, 0))
         .unwrap();
     class
+        .define_method("call", method!(BoaxObject::js_call, -1))
+        .unwrap();
+    class
         .define_method("[]", method!(BoaxObject::subscript_get, 1))
         .unwrap();
     class
@@ -801,6 +1075,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("Boax")?;
     module.define_module_function("eval", function!(boax_eval, 1))?;
     module.define_module_function("import", function!(boax_import, 1))?;
+    module.define_module_function("require", function!(boax_require, 1))?;
     module.define_module_function("init", function!(boax_init, 1))?;
 
     Ok(())

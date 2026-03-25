@@ -14,6 +14,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "lodash-es": "^4.17.23"
+    "lodash-es": "^4.17.23",
+    "minimist": "^1.2.8"
   }
 }
