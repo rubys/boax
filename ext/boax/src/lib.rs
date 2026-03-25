@@ -196,7 +196,9 @@ thread_local! {
 fn ensure_context_initialized() {
     CONTEXT.with(|ctx| {
         if ctx.borrow().is_none() {
-            let context = Context::default();
+            let mut context = Context::default();
+            // Register Web API extensions: URL, setTimeout, TextEncoder, console, etc.
+            let _ = boa_runtime::register(boa_runtime::extensions::ConsoleExtension::default(), None, &mut context);
             *ctx.borrow_mut() = Some(context);
         }
     });
@@ -736,10 +738,11 @@ fn boax_init(root: String) -> Result<Value, Error> {
     );
 
     // Rebuild the context with the module loader
-    let context = Context::builder()
+    let mut context = Context::builder()
         .module_loader(loader.clone())
         .build()
         .map_err(|e| Error::new(ruby_error_class(), format!("{e}")))?;
+    let _ = boa_runtime::register(boa_runtime::extensions::ConsoleExtension::default(), None, &mut context);
 
     // Store both
     MODULE_LOADER.with(|l| *l.borrow_mut() = Some(loader));

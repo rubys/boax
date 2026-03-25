@@ -29,7 +29,8 @@ _.uniq([1, 1, 2, 3, 3]).to_ruby          # => [1, 2, 3]
 - **Type conversion** — nil, bool, integer, float, string, symbol, array, hash (both directions)
 - **`to_ruby`** — deep conversion of JS arrays/objects to Ruby arrays/hashes
 - **npm packages** — ES module resolution via [oxc_resolver](https://github.com/nicolo-ribaudo/oxc-resolver) against `node_modules/`
-- **Node API modules** — `path`, `util`, `events`, `fs` (sync, callback, and `fs.promises`)
+- **Node API modules** — `path`, `util`, `events`, `fs`, `process`, `os`, `querystring`, `string_decoder`, `assert`, `url`
+- **Web API globals** — `URL`, `URLSearchParams`, `console`, `setTimeout`/`setInterval`, `TextEncoder`/`TextDecoder`, `structuredClone`
 
 ### What doesn't work (yet)
 
@@ -46,7 +47,7 @@ _.uniq([1, 1, 2, 3, 3]).to_ruby          # => [1, 2, 3]
 | Interface | `ctx.eval("...")` | `Boax.import('lodash-es').uniq([1,1,2]).to_ruby` |
 | ES modules | No | Yes |
 | npm packages | Manual bundling required | `Boax.import('package-name')` |
-| Node APIs | None | `path`, `util`, `events`, `fs` |
+| Node APIs | None | 10 built-in modules |
 | Platforms | No Windows, fork-safety issues | Everywhere Rust compiles |
 
 ## Getting started
