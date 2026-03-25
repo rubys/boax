@@ -7,8 +7,9 @@ Powered by [Boa](https://github.com/boa-dev/boa), a JavaScript engine written in
 ```ruby
 require 'boax'
 
-math = Boax.import('Math')
-math.sqrt(144)  # => 12
+intl = Boax.import('Intl')
+nf = intl.NumberFormat.new('en-US', { style: 'currency', currency: 'USD' })
+nf.format(1234.56)  # => "$1,234.56"
 
 Boax.init(root: __dir__)
 _ = Boax.import('lodash-es')
@@ -35,7 +36,7 @@ _.uniq([1, 1, 2, 3, 3]).to_ruby          # => [1, 2, 3]
 
 ### What doesn't work (yet)
 
-- **Intl** — Boa 0.21 has partial Intl support; `NumberFormat` and `DateTimeFormat` throw "unimplemented"
+- **Intl** — polyfilled `NumberFormat` (currency, percent) and `DateTimeFormat` for common locales; not full ICU coverage
 - **Performance** — Boa has no JIT; compute-heavy JS will be slower than V8
 - **Streams** — MVP without backpressure; no real async I/O
 - **HTTP, child_process** — not yet implemented

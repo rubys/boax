@@ -199,6 +199,8 @@ fn ensure_context_initialized() {
             let mut context = Context::default();
             // Register Web API extensions: URL, setTimeout, TextEncoder, console, etc.
             let _ = boa_runtime::register(boa_runtime::extensions::ConsoleExtension::default(), None, &mut context);
+            // Polyfill Intl.NumberFormat (currency/percent) and Intl.DateTimeFormat
+            node_apis::intl_polyfill::register_intl_polyfills(&mut context);
             *ctx.borrow_mut() = Some(context);
         }
     });
@@ -1011,6 +1013,7 @@ fn boax_init(root: String) -> Result<Value, Error> {
         .build()
         .map_err(|e| Error::new(ruby_error_class(), format!("{e}")))?;
     let _ = boa_runtime::register(boa_runtime::extensions::ConsoleExtension::default(), None, &mut context);
+    node_apis::intl_polyfill::register_intl_polyfills(&mut context);
 
     // Register CJS require native callback
     register_cjs_require_native(&mut context);

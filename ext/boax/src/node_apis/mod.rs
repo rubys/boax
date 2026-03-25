@@ -11,6 +11,7 @@ pub mod url_module;
 pub mod buffer;
 pub mod crypto;
 pub mod stream;
+pub mod intl_polyfill;
 
 use boa_engine::{Context, Module};
 
