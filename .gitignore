@@ -1,5 +1,6 @@
 *.swp
 /tmp/
+/node_modules/
 /lib/boax/boax.bundle
 /ext/boax/target/
 *.o

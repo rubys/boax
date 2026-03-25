@@ -1,0 +1,19 @@
+{
+  "name": "boax",
+  "version": "1.0.0",
+  "description": "Call JavaScript from Ruby. No bundling, no eval strings, no V8.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "lodash-es": "^4.17.23"
+  }
+}

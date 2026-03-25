@@ -1,21 +1,183 @@
 use std::cell::RefCell;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use boa_engine::{
-    Context, JsValue, Source,
+    Context, JsError, JsNativeError, JsResult, JsString, JsValue, Module, Source,
+    builtins::promise::PromiseState,
     js_string,
+    module::{ModuleLoader, Referrer, resolve_module_specifier},
     object::JsObject,
     property::PropertyKey,
 };
+use boa_gc::GcRefCell;
 use magnus::{
     prelude::*,
     function, method,
     value::Lazy,
     Error, ExceptionClass, Ruby, TryConvert, Value, RArray, RHash,
 };
+use oxc_resolver::{ResolveOptions, Resolver};
+use rustc_hash::FxHashMap;
 
-// Thread-local JS context
+// --- NpmModuleLoader ---
+
+struct NpmModuleLoader {
+    root: PathBuf,
+    resolver: Resolver,
+    module_map: GcRefCell<FxHashMap<PathBuf, Module>>,
+}
+
+impl std::fmt::Debug for NpmModuleLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NpmModuleLoader")
+            .field("root", &self.root)
+            .finish()
+    }
+}
+
+impl NpmModuleLoader {
+    fn new(root: PathBuf) -> JsResult<Self> {
+        let canonical_root = root.canonicalize().map_err(|e| {
+            JsNativeError::typ()
+                .with_message(format!("could not resolve root path `{}`", root.display()))
+                .with_cause(JsError::from_opaque(js_string!(e.to_string()).into()))
+        })?;
+
+        let options = ResolveOptions {
+            condition_names: vec!["import".into(), "module".into(), "default".into()],
+            extensions: vec![".js".into(), ".mjs".into(), ".json".into()],
+            main_fields: vec!["module".into(), "main".into()],
+            ..ResolveOptions::default()
+        };
+
+        Ok(Self {
+            root: canonical_root,
+            resolver: Resolver::new(options),
+            module_map: GcRefCell::default(),
+        })
+    }
+
+    fn insert(&self, path: PathBuf, module: Module) {
+        self.module_map.borrow_mut().insert(path, module);
+    }
+
+    fn get(&self, path: &Path) -> Option<Module> {
+        self.module_map.borrow().get(path).cloned()
+    }
+
+    /// Resolve a specifier to an absolute file path.
+    fn resolve_path(
+        &self,
+        specifier: &str,
+        referrer_path: Option<&Path>,
+        context: &mut Context,
+    ) -> JsResult<PathBuf> {
+        let is_relative = specifier.starts_with("./") || specifier.starts_with("../");
+
+        if is_relative {
+            // Use Boa's built-in path resolution for relative imports
+            resolve_module_specifier(
+                Some(&self.root),
+                &js_string!(specifier),
+                referrer_path,
+                context,
+            )
+        } else {
+            // Bare specifier → resolve via oxc_resolver from the referrer's directory
+            // or the project root
+            let resolve_dir = referrer_path
+                .and_then(|p| p.parent())
+                .unwrap_or(&self.root);
+
+            self.resolver
+                .resolve(resolve_dir, specifier)
+                .map(|resolution| resolution.into_path_buf())
+                .map_err(|err| {
+                    JsNativeError::typ()
+                        .with_message(format!("could not resolve module '{specifier}': {err}"))
+                        .into()
+                })
+        }
+    }
+}
+
+impl ModuleLoader for NpmModuleLoader {
+    fn load_imported_module(
+        self: Rc<Self>,
+        referrer: Referrer,
+        specifier: JsString,
+        context: &RefCell<&mut Context>,
+    ) -> impl Future<Output = JsResult<Module>> {
+        let result = (|| {
+            let spec_str = specifier.to_std_string_escaped();
+            let mut ctx = context.borrow_mut();
+
+            let path = self.resolve_path(&spec_str, referrer.path(), &mut ctx)?;
+
+            // Check cache
+            if let Some(module) = self.get(&path) {
+                return Ok(module);
+            }
+
+            // Load from filesystem
+            let source = Source::from_filepath(&path).map_err(|err| {
+                JsNativeError::typ()
+                    .with_message(format!("could not open `{}`", path.display()))
+                    .with_cause(JsError::from_opaque(js_string!(err.to_string()).into()))
+            })?;
+
+            // Check if JSON
+            let module = if path.extension().is_some_and(|ext| ext == "json") {
+                let json_str = std::fs::read_to_string(&path).map_err(|err| {
+                    JsNativeError::typ()
+                        .with_message(format!("could not read `{}`", path.display()))
+                        .with_cause(JsError::from_opaque(js_string!(err.to_string()).into()))
+                })?;
+                Module::parse_json(js_string!(&*json_str), &mut ctx)
+                    .map_err(|err| {
+                        JsNativeError::syntax()
+                            .with_message(format!("could not parse JSON module `{spec_str}`"))
+                            .with_cause(err)
+                    })?
+            } else {
+                Module::parse(source, None, &mut ctx).map_err(|err| {
+                    JsNativeError::syntax()
+                        .with_message(format!("could not parse module `{spec_str}`"))
+                        .with_cause(err)
+                })?
+            };
+
+            self.insert(path, module.clone());
+            Ok(module)
+        })();
+
+        async { result }
+    }
+
+    fn init_import_meta(
+        self: Rc<Self>,
+        import_meta: &JsObject,
+        module: &Module,
+        context: &mut Context,
+    ) {
+        if let Some(path) = module.path() {
+            let _ = import_meta.set(
+                js_string!("url"),
+                js_string!(format!("file://{}", path.display())),
+                false,
+                context,
+            );
+        }
+    }
+}
+
+// --- Thread-local state ---
+
 thread_local! {
     static CONTEXT: RefCell<Option<Context>> = RefCell::new(None);
+    static MODULE_LOADER: RefCell<Option<Rc<NpmModuleLoader>>> = RefCell::new(None);
 }
 
 fn ensure_context_initialized() {
@@ -205,7 +367,6 @@ fn js_to_ruby_deep(val: &JsValue, context: &mut Context) -> Result<Value, Error>
     let is_plain = match proto {
         Ok(ref ctor) => {
             if let Some(ctor_obj) = ctor.as_object() {
-                // Check if constructor is Object (plain object)
                 let name = ctor_obj.get(js_string!("name"), context);
                 matches!(name, Ok(ref n) if n.is_string() && n.as_string().unwrap().to_std_string_escaped() == "Object")
             } else {
@@ -433,6 +594,56 @@ fn value_to_property_key(val: Value) -> Result<PropertyKey, Error> {
     }
 }
 
+// --- Module import support ---
+
+/// Import an npm package by creating a synthetic entry module that
+/// re-exports everything from the package, then loading/linking/evaluating it.
+fn import_module(name: &str, context: &mut Context) -> Result<JsValue, Error> {
+    let loader = MODULE_LOADER.with(|l| l.borrow().clone()).ok_or_else(|| {
+        Error::new(
+            ruby_error_class(),
+            format!(
+                "module '{name}' not found as a JS global. \
+                 Call Boax.init(root: '/path/to/project') to enable npm package imports."
+            ),
+        )
+    })?;
+
+    // Create a synthetic entry module: export * from '<name>'
+    let entry_src = format!("export * from '{name}';\nexport {{ default }} from '{name}';");
+    let entry_path = loader.root.join(format!("__boax_entry_{name}__.mjs"));
+
+    let source = Source::from_reader(entry_src.as_bytes(), Some(&entry_path));
+    let module = Module::parse(source, None, context)
+        .map_err(|e| js_error_to_magnus(e, context))?;
+
+    // Insert entry module into the loader's cache so it can be found
+    loader.insert(entry_path, module.clone());
+
+    // Load, link, evaluate
+    let promise = module.load_link_evaluate(context);
+    context.run_jobs().map_err(|e| js_error_to_magnus(e, context))?;
+
+    // Check promise state
+    match promise.state() {
+        PromiseState::Fulfilled(_) => {}
+        PromiseState::Rejected(err) => {
+            let js_err = JsError::from_opaque(err);
+            return Err(js_error_to_magnus(js_err, context));
+        }
+        PromiseState::Pending => {
+            return Err(Error::new(
+                ruby_error_class(),
+                format!("module '{name}' did not finish loading"),
+            ));
+        }
+    }
+
+    // Get the module namespace (contains all exports)
+    let namespace = module.namespace(context);
+    Ok(namespace.into())
+}
+
 // --- Module-level functions ---
 
 fn boax_eval(code: String) -> Result<Value, Error> {
@@ -446,20 +657,55 @@ fn boax_eval(code: String) -> Result<Value, Error> {
 
 fn boax_import(name: String) -> Result<Value, Error> {
     with_context(|ctx| {
+        // First, try as a JS global (Math, JSON, Date, etc.)
         let global = ctx.global_object();
         let prop = global
             .get(js_string!(&*name), ctx)
             .map_err(|e| js_error_to_magnus(e, ctx))?;
 
-        if prop.is_undefined() {
-            return Err(Error::new(
-                ruby_error_class(),
-                format!("JS global '{name}' not found"),
-            ));
+        if !prop.is_undefined() {
+            return Ok(BoaxObject::wrap(prop));
         }
 
-        Ok(BoaxObject::wrap(prop))
+        // Not a global — try as an npm module
+        let ns = import_module(&name, ctx)?;
+        Ok(BoaxObject::wrap(ns))
     })
+}
+
+fn boax_init(root: String) -> Result<Value, Error> {
+    let root_path = PathBuf::from(&root);
+
+    // Verify node_modules exists
+    let node_modules = root_path.join("node_modules");
+    if !node_modules.is_dir() {
+        return Err(Error::new(
+            ruby_error_class(),
+            format!(
+                "node_modules not found at {}. Run 'npm install' first.",
+                node_modules.display()
+            ),
+        ));
+    }
+
+    // Create the module loader
+    let loader = Rc::new(
+        NpmModuleLoader::new(root_path)
+            .map_err(|e| Error::new(ruby_error_class(), format!("{e}")))?,
+    );
+
+    // Rebuild the context with the module loader
+    let context = Context::builder()
+        .module_loader(loader.clone())
+        .build()
+        .map_err(|e| Error::new(ruby_error_class(), format!("{e}")))?;
+
+    // Store both
+    MODULE_LOADER.with(|l| *l.borrow_mut() = Some(loader));
+    CONTEXT.with(|ctx| *ctx.borrow_mut() = Some(context));
+
+    let ruby = Ruby::get().unwrap();
+    Ok(ruby.qnil().as_value())
 }
 
 // --- Magnus class storage ---
@@ -511,6 +757,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("Boax")?;
     module.define_module_function("eval", function!(boax_eval, 1))?;
     module.define_module_function("import", function!(boax_import, 1))?;
+    module.define_module_function("init", function!(boax_init, 1))?;
 
     Ok(())
 }
