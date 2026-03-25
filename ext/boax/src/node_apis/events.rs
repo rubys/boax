@@ -1,5 +1,5 @@
 use boa_engine::{
-    Context, JsString, Module,
+    Context, JsString, JsValue, Module,
     js_string,
     module::SyntheticModuleInitializer,
 };
@@ -7,21 +7,40 @@ use boa_engine::{
 const EXPORT_NAMES: &[&str] = &["default", "EventEmitter"];
 
 pub fn create_module(context: &mut Context) -> Module {
-    let export_names: Vec<JsString> = EXPORT_NAMES.iter().map(|n| js_string!(*n)).collect();
+    // Register EventEmitter on globalThis first, then re-export.
+    // This avoids a Boa GC issue where synthetic module namespace
+    // properties get corrupted after heavy object use.
+    ensure_event_emitter_global(context);
 
+    let export_names: Vec<JsString> = EXPORT_NAMES.iter().map(|n| js_string!(*n)).collect();
     Module::synthetic(
         &export_names,
         SyntheticModuleInitializer::from_copy_closure(init_events_module),
-        None,
-        None,
-        context,
+        None, None, context,
     )
 }
 
+fn ensure_event_emitter_global(context: &mut Context) {
+    let global = context.global_object();
+    let existing = global.get(js_string!("EventEmitter"), context).unwrap_or(JsValue::undefined());
+    if !existing.is_undefined() {
+        return;
+    }
+
+    let _ = context.eval(boa_engine::Source::from_bytes(EMITTER_JS));
+}
+
 fn init_events_module(module: &boa_engine::module::SyntheticModule, context: &mut Context) -> boa_engine::JsResult<()> {
-    // Build EventEmitter as a JS class using eval (constructor + prototype methods).
-    // This is simpler than implementing boa's Class trait and works well for Phase 3.
-    let emitter_src = r#"
+    let global = context.global_object();
+    let emitter_ctor = global.get(js_string!("EventEmitter"), context)?;
+
+    module.set_export(&js_string!("default"), emitter_ctor.clone())?;
+    module.set_export(&js_string!("EventEmitter"), emitter_ctor)?;
+
+    Ok(())
+}
+
+const EMITTER_JS: &str = r#"
 (function() {
     function EventEmitter() {
         this._events = {};
@@ -102,18 +121,7 @@ fn init_events_module(module: &boa_engine::module::SyntheticModule, context: &mu
 
     EventEmitter.defaultMaxListeners = 10;
 
+    globalThis.EventEmitter = EventEmitter;
     return EventEmitter;
 })()
 "#;
-
-    let emitter_ctor = context.eval(boa_engine::Source::from_bytes(emitter_src))
-        .map_err(|e| {
-            boa_engine::JsNativeError::syntax()
-                .with_message(format!("failed to create EventEmitter: {e}"))
-        })?;
-
-    module.set_export(&js_string!("default"), emitter_ctor.clone())?;
-    module.set_export(&js_string!("EventEmitter"), emitter_ctor)?;
-
-    Ok(())
-}

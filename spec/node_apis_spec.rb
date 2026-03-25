@@ -181,24 +181,17 @@ RSpec.describe "Node.js API modules", skip: !File.directory?(File.join(__dir__, 
   end
 
   describe "events module" do
-    # Grab EventEmitter constructor once to avoid a Boa namespace GC issue
-    # where the synthetic module namespace property can get corrupted after
-    # heavy object use.
-    before(:all) do
-      @event_emitter = Boax.import("events")["EventEmitter"]
-    end
-
     it "is importable as 'events'" do
       expect(Boax.import("events")).to be_a(Boax::JsObject)
     end
 
     it "constructs EventEmitter" do
-      ee = @event_emitter.new
+      ee = Boax.import("events").EventEmitter.new
       expect(ee).to be_a(Boax::JsObject)
     end
 
     it "supports on/emit" do
-      ee = @event_emitter.new
+      ee = Boax.import("events").EventEmitter.new
       Boax.eval("globalThis.__emitResult = null; globalThis.__emitCb = function(v) { globalThis.__emitResult = v; }")
       ee.on("test", Boax.eval("globalThis.__emitCb"))
       ee.emit("test", "hello")
@@ -206,7 +199,7 @@ RSpec.describe "Node.js API modules", skip: !File.directory?(File.join(__dir__, 
     end
 
     it "supports listenerCount" do
-      ee = @event_emitter.new
+      ee = Boax.import("events").EventEmitter.new
       expect(ee.listenerCount("test")).to eq(0)
       Boax.eval("globalThis.__noop = function() {}")
       ee.on("test", Boax.eval("globalThis.__noop"))
@@ -214,7 +207,7 @@ RSpec.describe "Node.js API modules", skip: !File.directory?(File.join(__dir__, 
     end
 
     it "supports once (listener fires only once)" do
-      ee = @event_emitter.new
+      ee = Boax.import("events").EventEmitter.new
       Boax.eval("globalThis.__onceN = 0; globalThis.__onceFn = function() { globalThis.__onceN++; }")
       ee.once("ping", Boax.eval("globalThis.__onceFn"))
       ee.emit("ping")
@@ -223,7 +216,7 @@ RSpec.describe "Node.js API modules", skip: !File.directory?(File.join(__dir__, 
     end
 
     it "supports eventNames" do
-      ee = @event_emitter.new
+      ee = Boax.import("events").EventEmitter.new
       Boax.eval("globalThis.__fn1 = function() {}; globalThis.__fn2 = function() {}")
       ee.on("a", Boax.eval("globalThis.__fn1"))
       ee.on("b", Boax.eval("globalThis.__fn2"))

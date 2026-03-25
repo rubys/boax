@@ -114,21 +114,6 @@ promise.then!(callback)
 
 This works for any JS method name that conflicts with a Ruby method. The `!` is stripped before the JS property lookup, so `obj.then!(cb)` calls `obj.then(cb)` on the JS side.
 
-## Known Issues
-
-**Cache constructor references from Node API modules.** A Boa GC issue can corrupt synthetic module namespace properties after heavy object use. Grab constructors once rather than re-accessing them from the module:
-
-```ruby
-# Reliable
-EventEmitter = Boax.import("events")["EventEmitter"]
-ee = EventEmitter.new
-
-# May fail after heavy use
-ee = Boax.import("events").EventEmitter.new
-```
-
-This only affects the built-in Node API modules (`path`, `util`, `events`, `fs`), not npm packages.
-
 ## License
 
 This project is licensed under the [Unlicense](./LICENSE-UNLICENSE) or [MIT](./LICENSE-MIT) licenses, at your option.
