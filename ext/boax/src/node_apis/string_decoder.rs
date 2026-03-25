@@ -1,5 +1,5 @@
 use boa_engine::{
-    Context, JsString, Module,
+    Context, JsString, JsValue, Module,
     js_string,
     module::SyntheticModuleInitializer,
 };
@@ -7,6 +7,8 @@ use boa_engine::{
 const EXPORT_NAMES: &[&str] = &["default", "StringDecoder"];
 
 pub fn create_module(context: &mut Context) -> Module {
+    ensure_string_decoder_global(context);
+
     let export_names: Vec<JsString> = EXPORT_NAMES.iter().map(|n| js_string!(*n)).collect();
     Module::synthetic(
         &export_names,
@@ -15,11 +17,27 @@ pub fn create_module(context: &mut Context) -> Module {
     )
 }
 
+fn ensure_string_decoder_global(context: &mut Context) {
+    let global = context.global_object();
+    let existing = global.get(js_string!("StringDecoder"), context).unwrap_or(JsValue::undefined());
+    if !existing.is_undefined() {
+        return;
+    }
+
+    let _ = context.eval(boa_engine::Source::from_bytes(STRING_DECODER_JS));
+}
+
 fn init_module(module: &boa_engine::module::SyntheticModule, context: &mut Context) -> boa_engine::JsResult<()> {
-    // StringDecoder is a simple class that decodes Buffer chunks to strings,
-    // handling multi-byte characters that may be split across chunks.
-    // For our purposes (no real Buffer yet), a minimal implementation suffices.
-    let src = r#"
+    let global = context.global_object();
+    let ctor = global.get(js_string!("StringDecoder"), context)?;
+
+    module.set_export(&js_string!("default"), ctor.clone())?;
+    module.set_export(&js_string!("StringDecoder"), ctor)?;
+
+    Ok(())
+}
+
+const STRING_DECODER_JS: &str = r#"
 (function() {
     function StringDecoder(encoding) {
         this.encoding = (encoding || 'utf8').toLowerCase();
@@ -43,18 +61,7 @@ fn init_module(module: &boa_engine::module::SyntheticModule, context: &mut Conte
 
     StringDecoder.prototype.text = StringDecoder.prototype.write;
 
+    globalThis.StringDecoder = StringDecoder;
     return StringDecoder;
 })()
 "#;
-
-    let ctor = context.eval(boa_engine::Source::from_bytes(src))
-        .map_err(|e| {
-            boa_engine::JsNativeError::syntax()
-                .with_message(format!("failed to create StringDecoder: {e}"))
-        })?;
-
-    module.set_export(&js_string!("default"), ctor.clone())?;
-    module.set_export(&js_string!("StringDecoder"), ctor)?;
-
-    Ok(())
-}
