@@ -20,7 +20,7 @@ pub fn create_module(context: &mut Context) -> Module {
     )
 }
 
-fn ensure_event_emitter_global(context: &mut Context) {
+pub(super) fn ensure_event_emitter_global(context: &mut Context) {
     let global = context.global_object();
     let existing = global.get(js_string!("EventEmitter"), context).unwrap_or(JsValue::undefined());
     if !existing.is_undefined() {

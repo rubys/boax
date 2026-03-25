@@ -29,7 +29,7 @@ _.uniq([1, 1, 2, 3, 3]).to_ruby          # => [1, 2, 3]
 - **Type conversion** — nil, bool, integer, float, string, symbol, array, hash (both directions)
 - **`to_ruby`** — deep conversion of JS arrays/objects to Ruby arrays/hashes
 - **npm packages** — ES module resolution via [oxc_resolver](https://github.com/nicolo-ribaudo/oxc-resolver) against `node_modules/`
-- **Node API modules** — `path`, `util`, `events`, `fs`, `process`, `os`, `querystring`, `string_decoder`, `assert`, `url`, `buffer`, `crypto`
+- **Node API modules** — `path`, `util`, `events`, `fs`, `process`, `os`, `querystring`, `string_decoder`, `assert`, `url`, `buffer`, `crypto`, `stream`
 - **Web API globals** — `URL`, `URLSearchParams`, `console`, `setTimeout`/`setInterval`, `TextEncoder`/`TextDecoder`, `structuredClone`
 
 ### What doesn't work (yet)
@@ -37,7 +37,8 @@ _.uniq([1, 1, 2, 3, 3]).to_ruby          # => [1, 2, 3]
 - **Intl** — Boa 0.21 has partial Intl support; `NumberFormat` and `DateTimeFormat` throw "unimplemented"
 - **Performance** — Boa has no JIT; compute-heavy JS will be slower than V8
 - **CommonJS** — only ES modules are supported; CJS packages need a bundler
-- **Streams, HTTP, child_process** — not yet implemented
+- **Streams** — MVP without backpressure; no real async I/O
+- **HTTP, child_process** — not yet implemented
 
 ## Why not mini_racer?
 
@@ -47,7 +48,7 @@ _.uniq([1, 1, 2, 3, 3]).to_ruby          # => [1, 2, 3]
 | Interface | `ctx.eval("...")` | `Boax.import('lodash-es').uniq([1,1,2]).to_ruby` |
 | ES modules | No | Yes |
 | npm packages | Manual bundling required | `Boax.import('package-name')` |
-| Node APIs | None | 12 built-in modules |
+| Node APIs | None | 13 built-in modules |
 | Platforms | No Windows, fork-safety issues | Everywhere Rust compiles |
 
 ## Getting started

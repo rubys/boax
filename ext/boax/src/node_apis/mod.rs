@@ -10,6 +10,7 @@ pub mod assert;
 pub mod url_module;
 pub mod buffer;
 pub mod crypto;
+pub mod stream;
 
 use boa_engine::{Context, Module};
 
@@ -20,7 +21,8 @@ pub fn resolve_node_builtin(specifier: &str) -> Option<&str> {
     match name {
         "path" | "path/posix" | "util" | "events" | "fs" |
         "process" | "os" | "querystring" | "string_decoder" |
-        "assert" | "assert/strict" | "url" | "buffer" | "crypto" => Some(name),
+        "assert" | "assert/strict" | "url" | "buffer" | "crypto" |
+        "stream" | "stream/promises" => Some(name),
         _ => None,
     }
 }
@@ -40,6 +42,7 @@ pub fn create_node_module(name: &str, context: &mut Context) -> Module {
         "url" => url_module::create_module(context),
         "buffer" => buffer::create_module(context),
         "crypto" => crypto::create_module(context),
+        "stream" | "stream/promises" => stream::create_module(context),
         _ => unreachable!("unknown node builtin: {name}"),
     }
 }
